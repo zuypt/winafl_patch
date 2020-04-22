@@ -42,6 +42,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <stdint.h>
+#include <psapi.h>
+#include <dbghelp.h>
 
 #define UNKNOWN_MODULE_ID USHRT_MAX
 
@@ -106,6 +109,7 @@ typedef struct _winafl_option_t {
     drwrap_callconv_t callconv;
     bool thread_coverage;
     bool no_loop;
+    bool log_exception;
     bool dr_persist_cache;
 } winafl_option_t;
 static winafl_option_t options;
@@ -115,6 +119,7 @@ static winafl_option_t options;
 typedef struct _winafl_data_t {
     module_entry_t *cache[NUM_THREAD_MODULE_CACHE];
     file_t  log;
+    file_t exception_log;
     unsigned char *fake_afl_area; //used for thread_coverage
     unsigned char *afl_area;
 } winafl_data_t;
@@ -227,6 +232,95 @@ dump_winafl_data()
     dr_write_file(winafl_data.log, winafl_data.afl_area, MAP_SIZE);
 }
 
+static void log_stack( ptr_uint_t* esp, size_t log_size )
+{
+    ptr_uint_t addr = 0;
+    ptr_uint_t module_base = 0;
+    const char* module_name = NULL;
+
+    if(winafl_data.exception_log)
+    {
+        dr_fprintf(winafl_data.exception_log, "StackTrace\n");
+        for (int i = 0; i < log_size; i++)
+        {
+            module_entry_t *mod_entry;        
+            addr = esp[i];
+            mod_entry = module_table_lookup(NULL, NUM_THREAD_MODULE_CACHE, module_table, (ptr_uint_t)addr);
+            if(mod_entry)
+            {
+                module_base = mod_entry->data->start;
+                module_name = dr_module_preferred_name(mod_entry->data);
+                dr_fprintf(winafl_data.exception_log, "[%02d]\tmodule: %s, base: %p, pc:%p, offset: %p\n", i, module_name, module_base, addr, addr - module_base);
+            }
+            else
+            {
+                dr_fprintf(winafl_data.exception_log, "[%02d]\t%p\n", i, addr);
+            }
+        }
+    }
+}
+
+static void log_exception(dr_exception_t *excpt)
+{
+    ptr_uint_t module_base = 0;
+    const char* module_name = NULL;
+    DWORD exception_code = excpt->record->ExceptionCode;
+
+    if(!winafl_data.exception_log)
+    {   
+        char buf[MAXIMUM_PATH];
+        winafl_data.exception_log = drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
+                            "exception", "proc.log",
+                            DR_FILE_ALLOW_LARGE,
+                            buf, BUFFER_SIZE_ELEMENTS(buf));
+    }
+
+    if(winafl_data.exception_log)
+    {
+        ptr_uint_t exception_address = excpt->record->ExceptionAddress;
+        module_entry_t *mod_entry;        
+        mod_entry = module_table_lookup(NULL, NUM_THREAD_MODULE_CACHE, module_table, (ptr_uint_t)exception_address);
+        if(mod_entry)
+        {
+            module_base = mod_entry->data->start;
+            module_name = dr_module_preferred_name(mod_entry->data);
+        }
+        else
+        {
+            module_name = "undefined";
+        }
+
+        dr_fprintf(winafl_data.exception_log, "module: %s, base: %p, pc:%p, offset: %p, exception code: 0x%08X\n", 
+                    module_name, 
+                    module_base, 
+                    exception_address, 
+                    exception_address - module_base, 
+                    exception_code);
+
+        dr_mcontext_t mc = {sizeof(mc),DR_MC_ALL};
+        dr_get_mcontext(dr_get_current_drcontext(), &mc);
+        dr_fprintf(winafl_data.exception_log, "\teax: %p\n", reg_get_value(DR_REG_XAX, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tebx: %p\n", reg_get_value(DR_REG_XBX, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tecx: %p\n", reg_get_value(DR_REG_XCX, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tedx: %p\n", reg_get_value(DR_REG_XDX, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tesi: %p\n", reg_get_value(DR_REG_XSI, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tedi: %p\n", reg_get_value(DR_REG_XDI, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tebp: %p\n", reg_get_value(DR_REG_XBP, &mc));
+        dr_fprintf(winafl_data.exception_log, "\tesp: %p\n", reg_get_value(DR_REG_XSP, &mc));
+
+        dr_fprintf(winafl_data.exception_log, "Instruction Bytecodes: ");
+        uint8_t* ins = (uint8_t*)exception_address;
+        for(int i = 0; i < 20; i++)
+            dr_fprintf(winafl_data.exception_log, "%02x ", ins[i]);
+
+        PROCESS_MEMORY_COUNTERS info;
+        GetProcessMemoryInfo(GetCurrentProcess(), &info, sizeof(info));
+        dr_fprintf(winafl_data.exception_log, "\n\tWorkingSetSize 0x%x\n", info.WorkingSetSize);
+
+        log_stack(reg_get_value(DR_REG_XSP, &mc), 100);
+    }
+}
+
 static bool
 onexception(void *drcontext, dr_exception_t *excpt) {
     DWORD exception_code = excpt->record->ExceptionCode;
@@ -241,17 +335,26 @@ onexception(void *drcontext, dr_exception_t *excpt) {
        (exception_code == STATUS_HEAP_CORRUPTION) ||
        (exception_code == EXCEPTION_STACK_OVERFLOW) ||
        (exception_code == STATUS_STACK_BUFFER_OVERRUN) ||
-       (exception_code == STATUS_FATAL_APP_EXIT)) {
-            if(options.debug_mode) {
-                dr_fprintf(winafl_data.log, "crashed\n");
-            } else {
-        WriteCommandToPipe('C');
-        WriteDWORDCommandToPipe(exception_code);        
-            }
-            dr_exit_process(1);
+       (exception_code == STATUS_FATAL_APP_EXIT)) 
+    {
+        if(options.debug_mode) 
+        {
+            dr_fprintf(winafl_data.log, "crashed\n");
+        } 
+        else 
+        {
+            WriteCommandToPipe('C');
+        }
+
+        if(options.log_exception)
+        {
+            log_exception(excpt);
+        }
+        dr_exit_process(1);
     }
+
     return true;
-}
+} 
 
 static void event_thread_init(void *drcontext)
 {
@@ -1040,6 +1143,7 @@ options_init(client_id_t id, int argc, const char *argv[])
     options.fuzz_offset = 0;
     options.fuzz_iterations = 1000;
     options.no_loop = false;
+    options.log_exception = false;
     options.func_args = NULL;
     options.num_fuz_args = 0;
     options.callconv = DRWRAP_CALLCONV_DEFAULT;
@@ -1055,6 +1159,8 @@ options_init(client_id_t id, int argc, const char *argv[])
             options.nudge_kills = false;
         else if (strcmp(token, "-nudge_kills") == 0)
             options.nudge_kills = true;
+        else if (strcmp(token, "-log_exception") == 0)
+            options.log_exception = true;
         else if (strcmp(token, "-thread_coverage") == 0)
             options.thread_coverage = true;
         else if (strcmp(token, "-debug") == 0)
