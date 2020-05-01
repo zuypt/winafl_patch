@@ -5,7 +5,13 @@ from util import *
 from win_util import *
 
 '''for 32bit change this to 4'''
-PTR_SZ = 8
+if sys.argv[2] == '64':
+	is_64 = 1
+	gpointer = u64_pointer
+	PTR_SZ = 8
+else:
+	PTR_SZ = 4
+	gpointer = u32_pointer
 
 module_t_sz = 264
 
@@ -26,10 +32,10 @@ def get_module_info():
 	modules = []
 
 	for i in range(MAX_COV_MODULE):
-		start = u64_pointer(MOD_INFO)[module_t_sz//PTR_SZ*i]
+		start = gpointer(MOD_INFO)[module_t_sz//PTR_SZ*i]
 		if start:
 			mod = {}
-			end = u64_pointer(MOD_INFO)[module_t_sz//PTR_SZ*i+1]
+			end = gpointer(MOD_INFO)[module_t_sz//PTR_SZ*i+1]
 			j = 2*PTR_SZ + module_t_sz*i
 			module_name = ''
 			while MOD_INFO[j] != 0:
@@ -52,7 +58,7 @@ modules = get_module_info()
 def get_map():
 	r = []
 
-	m = u64_pointer(MAP)
+	m = gpointer(MAP)
 	for blk_id in range(MAP_SZ//PTR_SZ):
 		addr = m[blk_id]
 		if (addr == 0):
