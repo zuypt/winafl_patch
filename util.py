@@ -7,13 +7,6 @@ abspath = os.path.abspath
 exists = os.path.exists
 join = os.path.join
 
-
-PACKAGE_DIR = dirname(abspath(__file__))
-
-CLIB32 				= join(PACKAGE_DIR, 'clib', 'bin32', 'release')
-CLIB64 				= join(PACKAGE_DIR, 'clib', 'bin64', 'release')
-FRIDA_SCRIPTDIR 	= join(PACKAGE_DIR, 'frida_scripts')
-
 def addressof(pointer):
 	return ctypes.addressof(pointer.contents)
 
@@ -42,15 +35,4 @@ def malloc(sz):
 
 def str2PCSTR(s):
 	return ctypes.c_char_p(bytes(s, 'ansi'))
-
-def next_pow2(n):
-	if n == 0:
-		return 0
-	out = n - 1
-	out |= out >> 1
-	out |= out >> 2
-	out |= out >> 4
-	out |= out >> 8
-	out |= out >> 16
-	return out + 1
 
